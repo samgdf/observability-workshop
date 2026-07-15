@@ -9,8 +9,8 @@ Galileo's `GalileoCallback` is a standard LangChain callback handler. When you a
 LangChain or LangGraph run, it automatically captures prompts, responses, model names, token usage,
 timing, and the nesting of each step.
 
-Because the travel planner is a **LangGraph** workflow, you don't need to edit every node. Instead,
-pass a single callback in the **run config** when the compiled graph is streamed. Galileo then records
+Because the travel planner is a LangGraph workflow, you don't need to edit every node. Instead,
+pass a single callback in the run config when the compiled graph is streamed. Splunk Agent Observability then records
 one trace per request, with a nested LLM span for each agent node (coordinator, flight, hotel,
 activity, and synthesizer).
 
@@ -38,7 +38,8 @@ In `plan_travel_internal()`, create a callback and attach it to the run config p
         final_state = node_state
 ```
 
-Update it to build a config that includes the Galileo callback (merging it with any existing config the app already passes). This passes the execution of each node in the agent to Galileo:
+   Update it to build a config that includes the Splunk Agent Observability callback (merging it with any existing
+   config the app already passes). This passes the execution of each node in the agent to Splunk Agent Observability:
 
 ```python
     workflow = build_workflow()
