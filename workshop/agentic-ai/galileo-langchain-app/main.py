@@ -1,0 +1,406 @@
+"""
+Multi-agent travel planner driven by LangGraph — Galileo-instrumented variant.
+
+This is the workshop 18 travel planner with Galileo (Splunk Agent Observability)
+tracing added. Two changes vs. the base app:
+
+  1. `galileo_context.init(...)` selects the project / log stream traces land in.
+  2. A single `GalileoCallback` is attached to the LangGraph run config so every
+     agent node's LLM call is captured in one trace per request.
+
+[User Request] --> [Pre-Parse: origin/dest/dates] --> START
+                    |
+                    v
+              [LangGraph Workflow]
+    ┌──────────┼──────────┼──────────┼──────────┐
+    |          |          |          |          |
+[Coord] --> [Flight] --> [Hotel] --> [Act.] --> [Synth] --> END
+    |          |          |          |          |
+    └──────────┼──────────┼──────────┼──────────┘
+               |          |          |
+          (Galileo trace + nested LLM spans)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from typing import Annotated, Dict, List, Optional, TypedDict
+from uuid import uuid4
+from flask import Flask, request, jsonify
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Begin: Galileo instrumentation
+from galileo import galileo_context
+from galileo.handlers.langchain import GalileoCallback
+
+# Only use a custom project / log stream when GALILEO_PROJECT / GALILEO_LOG_STREAM
+# are set (e.g. uncommented in .env). When unset these are None, and the Galileo
+# SDK falls back to its own "default" project and log stream — we never create an
+# override implicitly.
+galileo_context.init(
+    project=os.getenv("GALILEO_PROJECT"),
+    log_stream=os.getenv("GALILEO_LOG_STREAM"),
+)
+# End: Galileo instrumentation
+
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import AnyMessage, add_messages
+
+from langchain_core.messages import convert_to_messages
+
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+
+def _compute_dates() -> tuple[str, str]:
+    start = datetime.now() + timedelta(days=30)
+    end = start + timedelta(days=7)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# LangGraph state & helpers
+# ---------------------------------------------------------------------------
+
+
+class PlannerState(TypedDict):
+    """Shared state that moves through the LangGraph workflow."""
+
+    messages: Annotated[List[AnyMessage], add_messages]
+    user_request: str
+    session_id: str
+    origin: str
+    destination: str
+    departure: str
+    return_date: str
+    travellers: int
+    flight_summary: Optional[str]
+    hotel_summary: Optional[str]
+    activities_summary: Optional[str]
+    final_itinerary: Optional[str]
+    current_agent: str
+
+
+def _create_llm(agent_name: str, *, temperature: float, session_id: str) -> ChatOpenAI:
+    """Create an ChatOpenAI instance."""
+
+    model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4.1-mini")
+
+    return ChatOpenAI(
+        model=model_name,
+        temperature=temperature,
+        # Uses OPENAI_API_KEY and OPENAI_BASE_URL automatically from environment
+    )
+
+
+# ---------------------------------------------------------------------------
+# LangGraph nodes
+# ---------------------------------------------------------------------------
+
+
+def coordinator_node(state: PlannerState) -> PlannerState:
+    llm = _create_llm("coordinator", temperature=0.2, session_id=state["session_id"])
+
+    system_message = SystemMessage(
+        content=(
+            "You are the lead travel coordinator. Extract the key details from the "
+            "traveller's request and describe the plan for the specialist agents."
+        )
+    )
+
+    result = llm.invoke([system_message] + list(state["messages"]))
+    final_message = result
+    state["messages"].append(
+        final_message
+        if isinstance(final_message, BaseMessage)
+        else AIMessage(content=str(final_message))
+    )
+    state["current_agent"] = "flight_specialist"
+    return state
+
+
+def flight_specialist_node(state: PlannerState) -> PlannerState:
+    llm = _create_llm(
+        "flight_specialist", temperature=0.4, session_id=state["session_id"]
+    )
+
+    step = (
+        f"Find an appealing flight from {state['origin']} to {state['destination']} "
+        f"departing {state['departure']} for {state['travellers']} travellers."
+    )
+
+    messages = [
+        SystemMessage(content="You are a flight booking specialist. Provide concise options."),
+        HumanMessage(content=step),
+    ]
+
+    result = llm.invoke(messages)
+    final_message = result
+    state["flight_summary"] = final_message.content if isinstance(final_message, BaseMessage) else str(final_message)
+    state["messages"].append(final_message if isinstance(final_message, BaseMessage) else AIMessage(content=str(final_message)))
+    state["current_agent"] = "hotel_specialist"
+    return state
+
+
+def hotel_specialist_node(state: PlannerState) -> PlannerState:
+    llm = _create_llm(
+        "hotel_specialist", temperature=0.5, session_id=state["session_id"]
+    )
+
+    step = (
+        f"Recommend a boutique hotel in {state['destination']} between {state['departure']} "
+        f"and {state['return_date']} for {state['travellers']} travellers."
+    )
+
+    messages = [
+        SystemMessage(content="You are a hotel booking specialist. Provide concise options."),
+        HumanMessage(content=step),
+    ]
+
+    result = llm.invoke(messages)
+
+    final_message = result
+    state["hotel_summary"] = (
+        final_message.content
+        if isinstance(final_message, BaseMessage)
+        else str(final_message)
+    )
+    state["messages"].append(
+        final_message
+        if isinstance(final_message, BaseMessage)
+        else AIMessage(content=str(final_message))
+    )
+    state["current_agent"] = "activity_specialist"
+    return state
+
+
+def activity_specialist_node(state: PlannerState) -> PlannerState:
+    llm = _create_llm(
+        "activity_specialist", temperature=0.6, session_id=state["session_id"]
+    )
+
+    step = f"Curate signature activities for travellers spending a week in {state['destination']}."
+
+    messages = [
+        SystemMessage(content="You are an activities specialist. Provide concise options."),
+        HumanMessage(content=step),
+    ]
+
+    result = llm.invoke(messages)
+
+    final_message = result
+    state["activities_summary"] = (
+        final_message.content
+        if isinstance(final_message, BaseMessage)
+        else str(final_message)
+    )
+    state["messages"].append(
+        final_message
+        if isinstance(final_message, BaseMessage)
+        else AIMessage(content=str(final_message))
+    )
+    state["current_agent"] = "plan_synthesizer"
+    return state
+
+
+def plan_synthesizer_node(state: PlannerState) -> PlannerState:
+    llm = _create_llm(
+        "plan_synthesizer", temperature=0.3, session_id=state["session_id"]
+    )
+
+    system_content = (
+        "You are the travel plan synthesiser. Combine the specialist insights into a "
+        "concise, structured itinerary covering flights, accommodation and activities."
+    )
+
+    system_prompt = SystemMessage(content=system_content)
+    content = json.dumps(
+        {
+            "flight": state["flight_summary"],
+            "hotel": state["hotel_summary"],
+            "activities": state["activities_summary"],
+        },
+        indent=2,
+    )
+    response = llm.invoke(
+        [
+            system_prompt,
+            HumanMessage(
+                content=(
+                    f"Traveller request: {state['user_request']}\n\n"
+                    f"Origin: {state['origin']} | Destination: {state['destination']}\n"
+                    f"Dates: {state['departure']} to {state['return_date']}\n\n"
+                    f"Specialist summaries:\n{content}"
+                )
+            ),
+        ]
+    )
+    state["final_itinerary"] = response.content
+    state["messages"].append(response)
+    state["current_agent"] = "completed"
+    return state
+
+
+def should_continue(state: PlannerState) -> str:
+    mapping = {
+        "start": "coordinator",
+        "flight_specialist": "flight_specialist",
+        "hotel_specialist": "hotel_specialist",
+        "activity_specialist": "activity_specialist",
+        "plan_synthesizer": "plan_synthesizer",
+    }
+    return mapping.get(state["current_agent"], END)
+
+
+def build_workflow() -> StateGraph:
+    graph = StateGraph(PlannerState)
+    graph.add_node("coordinator", lambda state: coordinator_node(state))
+    graph.add_node("flight_specialist", lambda state: flight_specialist_node(state))
+    graph.add_node("hotel_specialist", lambda state: hotel_specialist_node(state))
+    graph.add_node("activity_specialist", lambda state: activity_specialist_node(state))
+    graph.add_node("plan_synthesizer", lambda state: plan_synthesizer_node(state))
+    graph.add_conditional_edges(START, should_continue)
+    graph.add_conditional_edges("coordinator", should_continue)
+    graph.add_conditional_edges("flight_specialist", should_continue)
+    graph.add_conditional_edges("hotel_specialist", should_continue)
+    graph.add_conditional_edges("activity_specialist", should_continue)
+    graph.add_conditional_edges("plan_synthesizer", should_continue)
+    return graph
+
+
+# ---------------------------------------------------------------------------
+# Flask server
+# ---------------------------------------------------------------------------
+
+app = Flask(__name__)
+
+
+def plan_travel_internal(
+    origin: str,
+    destination: str,
+    user_request: str,
+    travellers: int,
+) -> Dict[str, object]:
+    """Internal function to execute travel planning workflow."""
+    session_id = str(uuid4())
+    departure, return_date = _compute_dates()
+
+    initial_state: PlannerState = {
+        "messages": [HumanMessage(content=user_request)],
+        "user_request": user_request,
+        "session_id": session_id,
+        "origin": origin,
+        "destination": destination,
+        "departure": departure,
+        "return_date": return_date,
+        "travellers": travellers,
+        "flight_summary": None,
+        "hotel_summary": None,
+        "activities_summary": None,
+        "final_itinerary": None,
+        "current_agent": "start",
+    }
+
+    workflow = build_workflow()
+    compiled_app = workflow.compile()
+
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": 10,
+    }
+
+    # Begin: Galileo instrumentation
+    # One callback per request keeps each travel plan in its own trace. Attaching
+    # it at the graph level propagates it to every node's llm.invoke(...) call.
+    callback = GalileoCallback()
+    run_config = {**config, "callbacks": [callback]}
+    # End: Galileo instrumentation
+
+    final_state: Optional[PlannerState] = None
+    agent_steps = []
+
+    for step in compiled_app.stream(initial_state, run_config):
+        node_name, node_state = next(iter(step.items()))
+        final_state = node_state
+        agent_steps.append({"agent": node_name, "status": "completed"})
+
+    if not final_state:
+        final_plan = ""
+    else:
+        final_plan = final_state.get("final_itinerary") or ""
+
+    return {
+        "session_id": session_id,
+        "origin": origin,
+        "destination": destination,
+        "departure": departure,
+        "return_date": return_date,
+        "travellers": travellers,
+        "flight_summary": final_state.get("flight_summary") if final_state else None,
+        "hotel_summary": final_state.get("hotel_summary") if final_state else None,
+        "activities_summary": final_state.get("activities_summary")
+        if final_state
+        else None,
+        "final_itinerary": final_plan,
+        "agent_steps": agent_steps,
+    }
+
+
+@app.route("/travel/plan", methods=["POST"])
+def plan():
+    """Handle travel planning requests via HTTP POST."""
+    try:
+        data = request.get_json()
+
+        origin = data.get("origin", "Seattle")
+        destination = data.get("destination", "Paris")
+        user_request = data.get(
+            "user_request",
+            f"Planning a week-long trip from {origin} to {destination}. "
+            "Looking for boutique hotel, flights and unique experiences.",
+        )
+        travellers = int(data.get("travellers", 2))
+
+        logging.info(f"[SERVER] Processing travel plan: {origin} -> {destination}")
+
+        result = plan_travel_internal(
+            origin=origin,
+            destination=destination,
+            user_request=user_request,
+            travellers=travellers,
+        )
+
+        logging.info("[SERVER] Travel plan completed successfully")
+        return jsonify(result), 200
+
+    except Exception as e:
+        logging.error(f"[SERVER] Error processing travel plan: {e}")
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy", "service": "travel-planner-galileo"}), 200
+
+
+if __name__ == "__main__":
+    logging.info("[INFO] Starting Flask server on http://0.0.0.0:8080")
+    app.run(host="0.0.0.0", port=8080, debug=False)

@@ -16,7 +16,7 @@ across tools using a workload you already understand.
 
 {{% prerequisites title="Prerequisites" %}}
 
-* The workshop 18 travel planner app (`~/workshop/agentic-ai/base-app`), or your own copy of it.
+* The workshop Monitoring Agentic AI Applications travel planner app (`~/workshop/agentic-ai/base-app`), or your own copy of it.
 * A Splunk Agent Observability account and API key.
 * An OpenAI API key (the same `OPENAI_API_KEY` the app already uses).
 * Python 3.10+ environment with package install access.

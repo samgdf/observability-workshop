@@ -13,7 +13,7 @@ aliases:
 product: "Observability Cloud"
 ---
 
-This workshop picks up after workshop 18 and shows the fastest path to instrumenting a LangChain app with Splunk Agent Observability, powered by Galileo.
+This workshop shows the fastest path to instrumenting a LangChain app with Splunk Agent Observability, powered by Galileo.
 
 You will reuse the **multi-agent travel planner** from workshop [Monitoring Agentic AI Applications](ninja-workshops/ai/18-agentic-ai/). It is a Flask API backed by a LangGraph
 workflow whose nodes (coordinator, flight specialist, hotel specialist, activity specialist, and
